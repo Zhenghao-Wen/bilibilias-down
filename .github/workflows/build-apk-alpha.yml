@@ -1,6 +1,5 @@
 name: Build and Upload Compose APK (Alpha)
 
-# 仅手动触发（需要自动构建时可取消 push/pr 的注释）
 on:
   workflow_dispatch:
   # push:
@@ -15,14 +14,13 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       # ===================== 拉取源代码 =====================
       - name: Checkout source from 1250422131/bilibilias
         uses: actions/checkout@v4
         with:
           repository: 1250422131/bilibilias
-          ref: main                     # 源仓库主分支
+          ref: main
 
       # ===================== 环境准备 =====================
       - name: Set up JDK 21
@@ -31,8 +29,9 @@ jobs:
           distribution: zulu
           java-version: "21"
 
+      # 使用官方最新的 v4 Gradle Action
       - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
@@ -56,11 +55,13 @@ jobs:
           }
           echo "✅ Keystore verified"
 
-      - name: Export signing secrets to environment
+      - name: Export secrets to environment
         run: |
           echo "ALPHA_KEYSTORE_PASSWORD=${{ secrets.ALPHA_KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
           echo "ALPHA_KEY_ALIAS=${{ secrets.ALPHA_KEY_ALIAS }}" >> $GITHUB_ENV
           echo "ALPHA_KEY_PASSWORD=${{ secrets.ALPHA_KEY_PASSWORD }}" >> $GITHUB_ENV
+          # 将加密密码写入环境变量，避免特殊字符导致 Shell 解析崩溃
+          echo "ENCRYPT_CODE=${{ secrets.ENCRYPT_CODE }}" >> $GITHUB_ENV
 
       # ===================== 构建 =====================
       - name: Assemble alphaRelease
@@ -74,31 +75,51 @@ jobs:
           echo "=== All APK files ==="
           find app/build/outputs/apk -name "*.apk" -type f || true
 
-      # ===================== 上传产物 =====================
-      - name: Upload Universal APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: APK-alpha-universal
-          path: app/build/outputs/apk/alpha/release/*universal*.apk
-          if-no-files-found: error
+      # ===================== 环境稳健性检查 =====================
+      - name: Ensure p7zip-full is installed
+        run: |
+          if ! command -v 7z &> /dev/null; then
+            echo "7z not found, installing p7zip-full..."
+            sudo apt-get update && sudo apt-get install -y p7zip-full
+          else
+            echo "7z is already installed."
+          fi
 
-      - name: Upload arm64-v8a APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: APK-alpha-arm64-v8a
-          path: app/build/outputs/apk/alpha/release/*arm64-v8a*.apk
-          if-no-files-found: error
+      # ===================== 打包加密产物（仅 arm64-v8a）=====================
+      - name: Package and encrypt arm64-v8a APK
+        run: |
+          # 熔断检查：确保 ENCRYPT_CODE 不为空
+          if [ -z "$ENCRYPT_CODE" ]; then
+            echo "❌ ENCRYPT_CODE secret is empty! Aborting to prevent uploading unencrypted APK."
+            exit 1
+          fi
 
-      - name: Upload armeabi-v7a APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: APK-alpha-armeabi-v7a
-          path: app/build/outputs/apk/alpha/release/*armeabi-v7a*.apk
-          if-no-files-found: error
+          # 定位 arm64-v8a APK
+          APK_FILE=$(find app/build/outputs/apk/alpha/release -name "*arm64-v8a*.apk" -type f | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            echo "❌ arm64-v8a APK not found!"
+            find app/build/outputs/apk -name "*.apk" -type f
+            exit 1
+          fi
+          echo "✅ Found APK: $APK_FILE"
 
-      - name: Upload x86_64 APK
+          # 使用 7z 创建 AES-256 加密压缩包（-mhe=on 加密文件名）
+          OUTPUT_ZIP="bilibilias-alpha-arm64-v8a-encrypted.7z"
+          
+          # 通过环境变量 $ENCRYPT_CODE 传参，GitHub 会自动 Mask 日志中的敏感值
+          7z a -p"$ENCRYPT_CODE" -mhe=on -t7z "$OUTPUT_ZIP" "$APK_FILE"
+
+          echo "✅ Encrypted archive created: $OUTPUT_ZIP"
+          ls -lh "$OUTPUT_ZIP"
+
+          # 保存文件名供后续步骤使用
+          echo "ENCRYPTED_ZIP=$OUTPUT_ZIP" >> $GITHUB_ENV
+
+      # ===================== 上传加密产物 =====================
+      - name: Upload encrypted arm64-v8a APK
         uses: actions/upload-artifact@v4
         with:
-          name: APK-alpha-x86_64
-          path: app/build/outputs/apk/alpha/release/*x86_64*.apk
+          name: bilibilias-alpha-arm64-v8a-encrypted
+          path: ${{ env.ENCRYPTED_ZIP }}
           if-no-files-found: error
+          retention-days: 30
